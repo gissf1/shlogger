@@ -1,0 +1,289 @@
+#!/bin/bash
+# runs a script with stdout and stderr logged to a file
+
+# generally exit codes are:
+#  0 - success
+#  1 - fatal error
+#  2 - internal error or possible TODO
+
+# also, any non-zero exit code from the script will cause this script to
+# terminate with the same exit code.
+
+fatal() {
+	local RET=$1
+	shift
+	echo "FATAL: $*" >&2
+	exit $RET
+}
+
+prefixLines() {
+	# $1  prefix to add to lines
+	# add prefix to lines read from stdin
+	awk "{ print "'"'"$1"'"'" \$0 }"
+}
+
+trimLog() {
+	# if LOGFILE is longer than MAXLOGSIZE bytes, remove oldest lines
+	# $1  MAXLOGSIZE - file size in bytes to trigger cleanup
+	# $2  LOGFILE - filename of the log to cleanup
+	#
+	local MAXLOGSIZE=$1
+	local LOGFILE=$2
+	if [ ! -f "$LOGFILE" ]; then
+		return 0
+	fi
+	if [ ! -w "$LOGFILE" ]; then
+		fatal 1 "Unable to write to log file: $LOGFILE"
+	fi
+	local FILESIZE=$( stat -c %s "$LOGFILE" )
+	if [ "$FILESIZE" -gt "$MAXLOGSIZE" ]; then
+		# roughly aim for 70% of the maximum log size
+		local TARGETSIZE=$(( MAXLOGSIZE * 7 / 10 ))
+		local TARGETSKIP=$(( FILESIZE - $TARGETSIZE ))
+		# start with the last 70% of the log file
+		# skip lines until a "start" log entry is found
+		dd if="$LOGFILE" skip=1 ibs=$TARGETSKIP status=none obs=4096 | awk '
+			BEGIN {
+				FOUND_LINE_END=0
+				FOUND_NEXT_RUN=0
+			}
+			FOUND_LINE_END==0 {
+				FOUND_LINE_END=1
+				next
+			}
+			FOUND_NEXT_RUN==0 {
+				if (match($0, "^\\[([0-9]+-[0-9]+-[0-9]+ [0-9]+:[0-9]+:[0-9]+ [^]]*)\\] [0-9]+ start: (.*)$")) {
+					FOUND_NEXT_RUN=1
+					print
+				}
+				next
+			}
+			{
+				print
+			}
+		' > "$LOGFILE.tmp" \
+		&& mv "$LOGFILE.tmp" "$LOGFILE" \
+		|| fatal 1 "Error $? while attempting to clean up log file: $LOGFILE"
+	fi
+}
+
+getTimestamp() {
+	date +'%Y-%m-%d %H:%I:%S %Z'
+}
+
+getDefaultLogfile() {
+	basename "$( echo -n "$COMMAND" | awk '{ print $1 }' )" \
+	| sed -r 's/[^-+,.0-9:@A-Z^_a-z]/_/g'
+}
+
+usage() {
+	local BASENAME=$( basename "$SCRIPT" )
+	cat <<HELP
+usage: $BASENAME [LOG-OPTIONS...] [--] COMMAND [COMMAND_ARGS...]
+
+Environment Options:
+  LOGFILE        default for --output (log file path)
+  MAXLOGSIZE     default for --size   (log size)
+
+Log Options:
+  -h, --help            Show this help message and exit
+  -o, --output=FILE     Redirect stdout and stderr to specified file (default: $LOGFILE)
+  -s, --size=SIZE       Try to keep log file under SIZE bytes (min 512, default: $MAXLOGSIZE)
+  --                    Explicitly indicate end of LOG-OPTIONS
+
+Command:
+  The command to be executed, followed by its arguments.
+
+Example:
+  $ $BASENAME -o myscript.log -s 10240 -- /bin/bash -c "echo Hello World; sleep 5; echo Goodbye World"
+HELP
+}
+
+getValueFromEqualArg() {
+	local ARG="$1"
+	local value=$( sed -r 's/^[^=]+=//g; s/^(["'"'"'])(.*)\1/\2/g' <<< "$ARG" )
+	if [ -z "$value" ]; then
+		return 1
+	fi
+	echo -n "$value"
+}
+
+main() {
+	local MYDIR="$( dirname "$( realpath -e "$SCRIPT" )" )"
+
+	export MAXLOGSIZE
+
+	# process command line arguments
+	local HELP=""
+	local END_OF_ARGS=""
+	while [ $# -gt 0 ]; do
+		# if we reached the end of our arguments, build the command with arguments
+		if [ -n "$END_OF_ARGS" ]; then
+			COMMAND+=("$1")
+			shift
+			continue
+		fi
+		# process our command line arguments
+		ARG=$1
+		ARGVAL=""
+		# remap arguments with equals
+		case "$ARG" in
+			--output=*)
+				ARGVAL=$( getValueFromEqualArg "$ARG" )
+				EXITCODE=$?
+				if [ $EXITCODE != 0 ]; then
+					echo "Invalid argument: $ARG" >&2
+					HELP=1
+					break
+				fi
+				ARG="--output"
+				;;
+			--size=*)
+				ARGVAL=$( getValueFromEqualArg "$ARG" )
+				EXITCODE=$?
+				if [ $EXITCODE != 0 ]; then
+					echo "Invalid argument: $ARG" >&2
+					HELP=1
+					break
+				fi
+				ARG="--size"
+				;;
+		esac
+		# assume no equals in any other arguments
+		case "$ARG" in
+			-h|--help)
+				HELP=1
+				;;
+			-o|--output)
+				if [ -z "$ARGVAL" ]; then
+					ARGVAL=$2
+					shift
+				fi
+				LOGFILE="$ARGVAL"
+				;;
+			-s|--size)
+				if [ -z "$ARGVAL" ]; then
+					ARGVAL=$2
+					shift
+				fi
+				MAXLOGSIZE="$ARGVAL"
+				;;
+			--)
+				END_OF_ARGS=1
+				# make sure we have arguments before attempting to set COMMAND
+				if [ $# -gt 1 ]; then
+					shift
+					COMMAND=("$1")
+				fi
+				;;
+			*)
+				END_OF_ARGS=1
+				COMMAND=("$ARG")
+				;;
+		esac
+		shift
+	done
+
+	# if there is no help, show error message and help text
+	if [ -z "$COMMAND" ]; then
+		HELP=1
+		echo "FATAL: No command specified" >&2
+	fi
+
+	# default log path
+	if [ -z "$LOGFILE" ]; then
+		# update LOGFILE based on command
+		LOGFILE=$( getDefaultLogfile )
+		LOGFILE="$MYDIR/$LOGFILE.log"
+	fi
+
+	if [ -z "$MAXLOGSIZE" ]; then
+		# the default will be set below
+		true
+	elif ! [[ $MAXLOGSIZE =~ ^[1-9][0-9]*$ ]] || [ $MAXLOGSIZE -lt 512 ]; then
+		HELP=1
+		echo "Invalid MAXLOGSIZE value: $MAXLOGSIZE" >&2
+		MAXLOGSIZE=""
+	fi
+
+	# default log max size of 10MB
+	MAXLOGSIZE=${MAXLOGSIZE:-10485760}
+
+	if [ -n "$HELP" ]; then
+		usage
+		exit 1
+	fi
+
+	# validate LOGFILE path
+	LOGDIR=$( dirname "$LOGFILE" )
+	if [ ! -d "$LOGDIR" ]; then
+		# directory doesn't exist - FAIL
+		fatal 1 "Unable to create path to LOGFILE: $LOGFILE"
+	elif [ -e "$LOGFILE" ]; then
+		if [ ! -w "$LOGFILE" ]; then
+			# cannot update LOGFILE in directory - FAIL
+			fatal 1 "Unable to write to LOGFILE: $LOGFILE"
+		# else file exists and is writable - OK
+		fi
+	elif [ ! -w "$LOGDIR" ]; then
+		# cannot create LOGFILE in directory - FAIL
+		fatal 1 "Unable to create LOGFILE: $LOGFILE"
+	fi
+	# at this point: dir exists, file (is writable) or (does not exist, but can create)
+
+	# cleanup log file if it has gotten too large
+	trimLog "$MAXLOGSIZE" "$LOGFILE"
+
+	# track our PID
+	LOGPID=$$
+
+	# append a start marker to log
+	echo -e "[$( getTimestamp )] $LOGPID start: $COMMAND" >> "$LOGFILE"
+
+	exec 3>&1
+	EXITCODETMP="/tmp/exitcode.$$"
+	trap "rm '$EXITCODETMP'" INT TERM EXIT
+	echo -n '' > "$EXITCODETMP" || fatal 1 "could not write to temporary file: $EXITCODETMP"
+
+	# execute COMMAND with filtered output to log file
+	(
+		(
+			(
+				"${COMMAND[@]}"
+				echo -n "$?" > "$EXITCODETMP"
+			) | prefixLines "$LOGPID out: " >&3
+		) 2>&1 | prefixLines "$LOGPID err: " >&3
+	) 3>> "$LOGFILE"
+
+	# get exit code into variable
+	EXITCODE=$( cat "$EXITCODETMP" )
+
+	# append an end marker to log
+	echo -e "[$( getTimestamp )] $LOGPID exited with code $EXITCODE" >> "$LOGFILE"
+
+	# return the same code as COMMAND
+	exit $EXITCODE
+}
+
+if [ -z "$SCRIPT" ]; then
+	SCRIPT=$0
+fi
+
+if [ -z "$BATS_TEST_FILENAME" ]; then
+	main "$@"
+else
+	# tests for other scripts might run this as a child process
+	# try not to interfere with them
+	#
+	# echo "BATS_TEST_FILENAME=$BATS_TEST_FILENAME" >&2
+	# echo "\$0=$0" >&2
+	SCRIPTFN="${BATS_TEST_FILENAME%.bats}"
+	# echo "SCRIPTFN=$SCRIPTFN" >&2
+	# echo "SCRIPT=$SCRIPT" >&2
+	if [ "$SCRIPTFN" == "$SCRIPT" ] && [ "$SCRIPT" != "$0" ]; then
+		# this is being called from our own tests
+		true
+	else
+		main "$@"
+	fi
+fi
