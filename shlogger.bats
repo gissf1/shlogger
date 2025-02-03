@@ -126,6 +126,14 @@ function eecho() {
     COMMAND="/path/to/BEGIN./.END"
     result=$(getDefaultLogfile)
     [ "$result" = ".END" ] || eecho "FAILED TEST: $COMMAND -> $result"
+
+    # test control (< 0x20) and extended (>= 127) characters
+    # skipping 0, 9, 0xa, 0x20, 0x7f
+    for ORD in `seq 1 8` `seq 0xb 0x1f` `seq 127 255` ; do
+        COMMAND=$( printf "/path/to/BEGIN.$( printf "\\\\x%02x" $ORD ).END" )
+        result=$(getDefaultLogfile)
+        [ "$result" = "BEGIN._.END" ] || eecho "FAILED ORD TEST #$ORD: $COMMAND -> $result"
+    done
 }
 
 @test "setting MAXLOGSIZE updates the --help output" {
